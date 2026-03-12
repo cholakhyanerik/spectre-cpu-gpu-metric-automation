@@ -1,0 +1,26 @@
+# Виртуальное окружение
+.venv/
+env/
+venv/
+
+# Кэш Python и pytest
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Локальные конфигурации и секреты (ОБЯЗАТЕЛЬНО ИГНОРИРОВАТЬ)
+.env
+
+# Локальные артефакты тестов и отчеты
+report.html
+reports/
+*.log
+
+# Папки IDE (VS Code, PyCharm)
+.vscode/
+.idea/
+
+# Специфичные для macOS/Windows файлы ОС
+.DS_Store
+Thumbs.db
