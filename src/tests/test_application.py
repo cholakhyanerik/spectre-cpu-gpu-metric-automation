@@ -23,8 +23,9 @@ REPORTS_DIR = "reports"
 LATEST_DIR = os.path.join(REPORTS_DIR, "latest")
 HISTORY_DIR = os.path.join(REPORTS_DIR, "history")
 
-os.makedirs(LATEST_DIR, exist_ok=True)
-os.makedirs(HISTORY_DIR, exist_ok=True)
+def init_directories():
+    os.makedirs(LATEST_DIR, exist_ok=True)
+    os.makedirs(HISTORY_DIR, exist_ok=True)
 
 BASELINE_FILE = os.path.join(LATEST_DIR, "dev_baseline_metrics.json")
 
@@ -36,12 +37,30 @@ GPU_TOLERANCE_PERCENT = float(os.getenv("GPU_TOLERANCE_PERCENT", "0.1"))
 # ==========================================
 # ФУНКЦИИ МОНИТОРИНГА
 # ==========================================
-def get_process_tree_metrics(parent_process: psutil.Process):
+def get_process_tree_metrics(parent_process: psutil.Process, process_cache: dict):
     total_cpu = 0.0
     total_ram = 0.0
     try:
-        processes = [parent_process] + parent_process.children(recursive=True)
-        for p in processes:
+        children = parent_process.children(recursive=True)
+        current_pids = {p.pid for p in children}
+        current_pids.add(parent_process.pid)
+        
+        # Initialize new processes in cache
+        for p in [parent_process] + children:
+            if p.pid not in process_cache:
+                process_cache[p.pid] = p
+                try:
+                    p.cpu_percent(interval=None) # Initialize CPU counter
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                    
+        # Clean up dead processes from cache
+        keys_to_remove = [pid for pid in process_cache if pid not in current_pids]
+        for pid in keys_to_remove:
+            del process_cache[pid]
+            
+        # Collect metrics using cached objects
+        for p in process_cache.values():
             try:
                 cpu = p.cpu_percent(interval=None) / psutil.cpu_count()
                 ram = p.memory_info().rss / (1024 * 1024)
@@ -49,17 +68,28 @@ def get_process_tree_metrics(parent_process: psutil.Process):
                 total_ram += ram
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-    except psutil.NoSuchProcess:
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
     return total_cpu, total_ram
 
+LAST_GPU_CHECK_TIME = 0.0
+CACHED_GPU_VAL = 0.0
+
 def get_gpu_metric():
+    global LAST_GPU_CHECK_TIME, CACHED_GPU_VAL
     try:
         gpus = GPUtil.getGPUs()
         if gpus and gpus[0].load > 0:
             return gpus[0].load * 100 
     except Exception:
         pass
+
+    # Use WMI/Powershell fallback but throttle to every 3 seconds
+    current_time = time.time()
+    if current_time - LAST_GPU_CHECK_TIME < 3.0:
+        return CACHED_GPU_VAL
+        
+    LAST_GPU_CHECK_TIME = current_time
 
     try:
         cmd = r'(Get-Counter "\GPU Engine(*engtype_3D)\Utilization Percentage" -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Maximum | Select-Object -ExpandProperty Maximum'
@@ -69,13 +99,16 @@ def get_gpu_metric():
             text=True, 
             creationflags=subprocess.CREATE_NO_WINDOW
         )
-        if result.stdout.strip():
-            val = float(result.stdout.strip())
-            return val if val <= 100.0 else 100.0
+        stdout = result.stdout.strip()
+        if stdout:
+            # handle potential commas in float formatting from powershell
+            val = float(stdout.replace(',', '.'))
+            CACHED_GPU_VAL = val if val <= 100.0 else 100.0
+            return CACHED_GPU_VAL
     except Exception:
         pass
         
-    return 0.0
+    return CACHED_GPU_VAL
 
 # ==========================================
 # ФУНКЦИИ ГЕНЕРАЦИИ ГРАФИКОВ (С ТЕКСТОМ)
@@ -172,6 +205,7 @@ def generate_comparison_chart(dev_raw: dict, feature_raw: dict, diff_stats: dict
 # ОСНОВНОЙ ТЕСТ
 # ==========================================
 def test_manual_qa_monitoring():
+    init_directories()
     print(f"\n[АВТОМАТИЗАЦИЯ] Режим: {TEST_MODE}")
     print(f"[СТРОГИЕ ЛИМИТЫ] CPU: {CPU_TOLERANCE_PERCENT}%, RAM: {RAM_TOLERANCE_MB}MB, GPU: {GPU_TOLERANCE_PERCENT}%")
     
@@ -191,25 +225,42 @@ def test_manual_qa_monitoring():
     print("="*50 + "\n")
 
     time_sec, cpu_samples, ram_samples, gpu_samples = [], [], [], []
+    process_cache = {}
     
-    get_process_tree_metrics(ps_proc)
+    get_process_tree_metrics(ps_proc, process_cache)
     time.sleep(1)
 
     seconds_passed = 0
-    while True:
-        if process.poll() is not None or not ps_proc.is_running():
-            break
+    try:
+        while True:
+            if process.poll() is not None:
+                break
+                
+            try:
+                if not ps_proc.is_running():
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                break
+                
+            cpu_usage, ram_usage_mb = get_process_tree_metrics(ps_proc, process_cache)
+            gpu_usage = get_gpu_metric()
             
-        cpu_usage, ram_usage_mb = get_process_tree_metrics(ps_proc)
-        gpu_usage = get_gpu_metric()
-        
-        time_sec.append(seconds_passed)
-        cpu_samples.append(cpu_usage)
-        ram_samples.append(ram_usage_mb)
-        gpu_samples.append(gpu_usage)
-        
-        seconds_passed += 1
-        time.sleep(0.5)
+            time_sec.append(seconds_passed)
+            cpu_samples.append(cpu_usage)
+            ram_samples.append(ram_usage_mb)
+            gpu_samples.append(gpu_usage)
+            
+            seconds_passed += 1
+            time.sleep(0.5)
+    finally:
+        if process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            except Exception:
+                pass
 
     print("\n[АВТОМАТИЗАЦИЯ] Приложение закрыто. Генерация отчетов...")
     
