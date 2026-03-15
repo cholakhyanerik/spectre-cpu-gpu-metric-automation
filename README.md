@@ -35,8 +35,10 @@ uv add pytest-html python-dotenv GPUtil matplotlib setuptools
 # Режим тестирования: DEV (записать эталон) или FEATURE (сравнить с эталоном)
 TEST_MODE=DEV
 
-# Путь к билду, который сейчас тестируем (измените на свой локальный путь)
-TARGET_BUILD_PATH=C:\Users\chola\Downloads\spectre-terminal.exe
+# Путь к билду приложения (в зависимости от вашей ОС: Windows, Linux, macOS)
+# Пример Windows: C:\path\to\spectre-terminal.exe
+# Пример macOS: /Applications/Spectre Terminal.app/Contents/MacOS/Spectre Terminal
+TARGET_BUILD_PATH=
 
 # Допустимая деградация (Блокеры)
 CPU_TOLERANCE_PERCENT=0.1

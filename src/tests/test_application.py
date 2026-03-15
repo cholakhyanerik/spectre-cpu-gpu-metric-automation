@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import json
 import subprocess
@@ -15,7 +16,7 @@ load_dotenv()
 # ==========================================
 # КОНФИГУРАЦИЯ И ПУТИ
 # ==========================================
-TARGET_BUILD_PATH = os.getenv("TARGET_BUILD_PATH", r"C:\Users\chola\Downloads\spectre-terminal.exe")
+TARGET_BUILD_PATH = os.getenv("TARGET_BUILD_PATH")
 TEST_MODE = os.getenv("TEST_MODE", "FEATURE") 
 
 # Настройка директорий для отчетов
@@ -90,6 +91,9 @@ def get_gpu_metric():
         return CACHED_GPU_VAL
         
     LAST_GPU_CHECK_TIME = current_time
+
+    if sys.platform != "win32":
+        return CACHED_GPU_VAL
 
     try:
         cmd = r'(Get-Counter "\GPU Engine(*engtype_3D)\Utilization Percentage" -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Maximum | Select-Object -ExpandProperty Maximum'
@@ -209,7 +213,7 @@ def test_manual_qa_monitoring():
     print(f"\n[АВТОМАТИЗАЦИЯ] Режим: {TEST_MODE}")
     print(f"[СТРОГИЕ ЛИМИТЫ] CPU: {CPU_TOLERANCE_PERCENT}%, RAM: {RAM_TOLERANCE_MB}MB, GPU: {GPU_TOLERANCE_PERCENT}%")
     
-    if not os.path.exists(TARGET_BUILD_PATH):
+    if not TARGET_BUILD_PATH or not os.path.exists(TARGET_BUILD_PATH):
         pytest.skip(f"Билд не найден: {TARGET_BUILD_PATH}")
 
     process = subprocess.Popen([TARGET_BUILD_PATH])
