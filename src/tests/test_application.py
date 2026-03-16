@@ -1,208 +1,27 @@
 import os
-import sys
 import time
-import json
 import subprocess
 import psutil
 import pytest
-import GPUtil
-import matplotlib.pyplot as plt
-import statistics
 import datetime
-from dotenv import load_dotenv
+import json
+import sys
 
-load_dotenv()
+# Добавляем корневую директорию проекта в sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
-# ==========================================
-# КОНФИГУРАЦИЯ И ПУТИ
-# ==========================================
-DEV_BUILD_PATH = os.getenv("DEV_BUILD_PATH")
-FUTURE_BUILD_PATH = os.getenv("FUTURE_BUILD_PATH")
+from src.core.config import (
+    DEV_BUILD_PATH, FUTURE_BUILD_PATH,
+    LATEST_DIR, HISTORY_DIR,
+    CPU_TOLERANCE_PERCENT, RAM_TOLERANCE_MB, GPU_TOLERANCE_PERCENT,
+    init_directories
+)
+from src.core.monitor import ProcessMonitor, GPUMonitor
+from src.core.reporter import (
+    generate_single_chart, generate_comparison_chart, 
+    safe_calc_stats, archive_run
+)
 
-# Настройка директорий для отчетов
-REPORTS_DIR = "reports"
-LATEST_DIR = os.path.join(REPORTS_DIR, "latest")
-HISTORY_DIR = os.path.join(REPORTS_DIR, "history")
-
-def init_directories():
-    os.makedirs(LATEST_DIR, exist_ok=True)
-    os.makedirs(HISTORY_DIR, exist_ok=True)
-
-# Лимиты деградации
-CPU_TOLERANCE_PERCENT = float(os.getenv("CPU_TOLERANCE_PERCENT", "0.1"))
-RAM_TOLERANCE_MB = float(os.getenv("RAM_TOLERANCE_MB", "1.0"))
-GPU_TOLERANCE_PERCENT = float(os.getenv("GPU_TOLERANCE_PERCENT", "0.1"))
-
-# ==========================================
-# ФУНКЦИИ МОНИТОРИНГА
-# ==========================================
-def get_process_tree_metrics(parent_process: psutil.Process, process_cache: dict):
-    total_cpu = 0.0
-    total_ram = 0.0
-    try:
-        children = parent_process.children(recursive=True)
-        current_pids = {p.pid for p in children}
-        current_pids.add(parent_process.pid)
-        
-        # Initialize new processes in cache
-        for p in [parent_process] + children:
-            if p.pid not in process_cache:
-                process_cache[p.pid] = p
-                try:
-                    p.cpu_percent(interval=None) # Initialize CPU counter
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-                    
-        # Clean up dead processes from cache
-        keys_to_remove = [pid for pid in process_cache if pid not in current_pids]
-        for pid in keys_to_remove:
-            del process_cache[pid]
-            
-        # Collect metrics using cached objects
-        for p in process_cache.values():
-            try:
-                cpu = p.cpu_percent(interval=None) / psutil.cpu_count()
-                ram = p.memory_info().rss / (1024 * 1024)
-                total_cpu += cpu
-                total_ram += ram
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        pass
-    return total_cpu, total_ram
-
-LAST_GPU_CHECK_TIME = 0.0
-CACHED_GPU_VAL = 0.0
-
-def get_gpu_metric():
-    global LAST_GPU_CHECK_TIME, CACHED_GPU_VAL
-    try:
-        gpus = GPUtil.getGPUs()
-        if gpus and gpus[0].load > 0:
-            return gpus[0].load * 100 
-    except Exception:
-        pass
-
-    # Use WMI/Powershell fallback but throttle to every 3 seconds
-    current_time = time.time()
-    if current_time - LAST_GPU_CHECK_TIME < 3.0:
-        return CACHED_GPU_VAL
-        
-    LAST_GPU_CHECK_TIME = current_time
-
-    if sys.platform != "win32":
-        return CACHED_GPU_VAL
-
-    try:
-        cmd = r'(Get-Counter "\GPU Engine(*engtype_3D)\Utilization Percentage" -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Maximum | Select-Object -ExpandProperty Maximum'
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", cmd], 
-            capture_output=True, 
-            text=True, 
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        stdout = result.stdout.strip()
-        if stdout:
-            # handle potential commas in float formatting from powershell
-            val = float(stdout.replace(',', '.'))
-            CACHED_GPU_VAL = val if val <= 100.0 else 100.0
-            return CACHED_GPU_VAL
-    except Exception:
-        pass
-        
-    return CACHED_GPU_VAL
-
-# ==========================================
-# ФУНКЦИИ ГЕНЕРАЦИИ ГРАФИКОВ (С ТЕКСТОМ)
-# ==========================================
-def generate_single_chart(raw_data: dict, stats: dict, mode: str, output_path: str):
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 11), sharex=True)
-    fig.suptitle(f'System Metric Overview: Spectre Terminal ({mode})', fontsize=16, fontweight='bold')
-    
-    ax1.plot(raw_data['time'], raw_data['cpu'], label='CPU Usage (%)', color='tab:blue', linewidth=2)
-    ax1.fill_between(raw_data['time'], raw_data['cpu'], color='tab:blue', alpha=0.15)
-    ax1.set_ylabel('CPU (%)', fontweight='bold')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(loc='upper right')
-    
-    ax2.plot(raw_data['time'], raw_data['gpu'], label='GPU Load (%)', color='tab:green', linewidth=2)
-    ax2.fill_between(raw_data['time'], raw_data['gpu'], color='tab:green', alpha=0.15)
-    ax2.set_ylabel('GPU (%)', fontweight='bold')
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(loc='upper right')
-    
-    ax3.plot(raw_data['time'], raw_data['ram'], label='RAM Committed (MB)', color='tab:red', linewidth=2)
-    ax3.fill_between(raw_data['time'], raw_data['ram'], color='tab:red', alpha=0.15)
-    ax3.set_xlabel('Время (секунды)', fontweight='bold')
-    ax3.set_ylabel('RAM (MB)', fontweight='bold')
-    ax3.grid(True, alpha=0.3)
-    ax3.legend(loc='upper right')
-    
-    # Добавляем текстовый блок со средними значениями вниз картинки
-    summary_text = (
-        f"RESOURCE USAGE RANGES:\n"
-        f"CPU usage: from {stats['cpu']['min']}% to {stats['cpu']['max']}%\n"
-        f"RAM usage: from {stats['ram']['min']} MB to {stats['ram']['max']} MB\n"
-        f"GPU usage: from {stats['gpu']['min']}% to {stats['gpu']['max']}%"
-    )
-    
-    fig.text(0.5, 0.03, summary_text, ha='center', va='center', fontsize=12, fontweight='bold',
-             bbox=dict(facecolor='#f0f0f0', edgecolor='black', boxstyle='round,pad=0.5'))
-
-    plt.tight_layout(rect=[0, 0.12, 1, 1]) # Оставляем 12% снизу для текста
-    plt.savefig(output_path)
-    plt.close()
-    return output_path
-
-def generate_comparison_chart(dev_raw: dict, feature_raw: dict, diff_stats: dict, dev_stats: dict, feature_stats: dict, output_path: str):
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 11), sharex=True)
-    fig.suptitle('СРАВНЕНИЕ: DEV (пунктир) vs FEATURE (сплошная)', fontsize=16, fontweight='bold')
-    
-    ax1.plot(dev_raw['time'], dev_raw['cpu'], label='[DEV] CPU (%)', color='tab:blue', linestyle='--', alpha=0.6, linewidth=2)
-    ax1.plot(feature_raw['time'], feature_raw['cpu'], label='[FEATURE] CPU (%)', color='tab:blue', linewidth=2.5)
-    ax1.set_ylabel('CPU (%)', fontweight='bold')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(loc='upper right')
-    
-    ax2.plot(dev_raw['time'], dev_raw['gpu'], label='[DEV] GPU (%)', color='tab:green', linestyle='--', alpha=0.6, linewidth=2)
-    ax2.plot(feature_raw['time'], feature_raw['gpu'], label='[FEATURE] GPU (%)', color='tab:green', linewidth=2.5)
-    ax2.set_ylabel('GPU (%)', fontweight='bold')
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(loc='upper right')
-    
-    ax3.plot(dev_raw['time'], dev_raw['ram'], label='[DEV] RAM (MB)', color='tab:red', linestyle='--', alpha=0.6, linewidth=2)
-    ax3.plot(feature_raw['time'], feature_raw['ram'], label='[FEATURE] RAM (MB)', color='tab:red', linewidth=2.5)
-    ax3.set_xlabel('Время (секунды)', fontweight='bold')
-    ax3.set_ylabel('RAM (MB)', fontweight='bold')
-    ax3.grid(True, alpha=0.3)
-    ax3.legend(loc='upper right')
-    
-    # --- ЛОГИКА ТЕКСТОВОГО ЗАКЛЮЧЕНИЯ ---
-    def get_conclusion(name, dev_stat, feature_stat, unit):
-        dev_range = f"from {dev_stat['min']}{unit} to {dev_stat['max']}{unit}"
-        feat_range = f"from {feature_stat['min']}{unit} to {feature_stat['max']}{unit}"
-        return f"{name} usage: DEV ({dev_range}) vs FEATURE ({feat_range})"
-
-    cpu_text = get_conclusion("CPU", dev_stats['cpu'], feature_stats['cpu'], "%")
-    ram_text = get_conclusion("RAM", dev_stats['ram'], feature_stats['ram'], " MB")
-    gpu_text = get_conclusion("GPU", dev_stats['gpu'], feature_stats['gpu'], "%")
-    
-    summary_text = f"RESOURCE USAGE RANGES:\n{cpu_text}\n{ram_text}\n{gpu_text}"
-    
-    # Цвет фона рамки в зависимости от наличия деградации
-    bg_color = '#ffe6e6' if (diff_stats['cpu_diff'] > 0 or diff_stats['ram_diff'] > 0 or diff_stats['gpu_diff'] > 0) else '#e6ffe6'
-    
-    fig.text(0.5, 0.04, summary_text, ha='center', va='center', fontsize=12, fontweight='bold',
-             bbox=dict(facecolor=bg_color, edgecolor='black', boxstyle='round,pad=0.7'))
-
-    plt.tight_layout(rect=[0, 0.12, 1, 1]) # Оставляем 12% снизу для большого блока с выводами
-    plt.savefig(output_path)
-    plt.close()
-    return output_path
-
-# ==========================================
-# ОСНОВНОЙ ТЕСТ
-# ==========================================
 def test_manual_qa_monitoring_parallel():
     init_directories()
     print("\n[АВТОМАТИЗАЦИЯ] Режим: PARALLEL (DEV & FUTURE)")
@@ -213,7 +32,6 @@ def test_manual_qa_monitoring_parallel():
     if not FUTURE_BUILD_PATH or not os.path.exists(FUTURE_BUILD_PATH):
         pytest.skip(f"Билд FUTURE не найден: {FUTURE_BUILD_PATH}")
 
-    # Launch both processes
     dev_process = subprocess.Popen([DEV_BUILD_PATH])
     future_process = subprocess.Popen([FUTURE_BUILD_PATH])
     
@@ -238,10 +56,12 @@ def test_manual_qa_monitoring_parallel():
     dev_cpu_samples, dev_ram_samples, dev_gpu_samples = [], [], []
     future_cpu_samples, future_ram_samples, future_gpu_samples = [], [], []
     
-    dev_cache, future_cache = {}, {}
+    dev_monitor = ProcessMonitor(dev_ps)
+    future_monitor = ProcessMonitor(future_ps)
+    gpu_monitor = GPUMonitor()
     
-    get_process_tree_metrics(dev_ps, dev_cache)
-    get_process_tree_metrics(future_ps, future_cache)
+    dev_monitor.get_metrics()
+    future_monitor.get_metrics()
     time.sleep(1)
 
     seconds_passed = 0
@@ -250,7 +70,6 @@ def test_manual_qa_monitoring_parallel():
     
     try:
         while dev_running or future_running:
-            # Check DEV state
             if dev_running:
                 if dev_process.poll() is not None:
                     dev_running = False
@@ -261,7 +80,6 @@ def test_manual_qa_monitoring_parallel():
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         dev_running = False
             
-            # Check FUTURE state
             if future_running:
                 if future_process.poll() is not None:
                     future_running = False
@@ -275,9 +93,8 @@ def test_manual_qa_monitoring_parallel():
             if not dev_running and not future_running:
                 break
                 
-            # Read metrics
             if dev_running:
-                d_cpu, d_ram = get_process_tree_metrics(dev_ps, dev_cache)
+                d_cpu, d_ram = dev_monitor.get_metrics()
                 dev_cpu_samples.append(d_cpu)
                 dev_ram_samples.append(d_ram)
             else:
@@ -285,14 +102,14 @@ def test_manual_qa_monitoring_parallel():
                 dev_ram_samples.append(0.0)
                 
             if future_running:
-                f_cpu, f_ram = get_process_tree_metrics(future_ps, future_cache)
+                f_cpu, f_ram = future_monitor.get_metrics()
                 future_cpu_samples.append(f_cpu)
                 future_ram_samples.append(f_ram)
             else:
                 future_cpu_samples.append(0.0)
                 future_ram_samples.append(0.0)
                 
-            gpu_load = get_gpu_metric()
+            gpu_load = gpu_monitor.get_metric()
             if dev_running:
                 dev_gpu_samples.append(gpu_load)
             else:
@@ -320,17 +137,6 @@ def test_manual_qa_monitoring_parallel():
 
     print("\n[АВТОМАТИЗАЦИЯ] Оба приложения закрыты. Генерация отчетов...")
 
-    def safe_calc_stats(samples):
-        valid = [s for s in samples if s > 0]
-        if not valid:
-            valid = [0.0]
-        return {
-            "avg": round(sum(valid) / len(valid), 2),
-            "max": round(max(valid), 2),
-            "min": round(min(valid), 2),
-            "median": round(statistics.median(valid), 2)
-        }
-        
     dev_metrics = {
         "duration_seconds": len(dev_cpu_samples),
         "cpu": safe_calc_stats(dev_cpu_samples),
@@ -349,17 +155,14 @@ def test_manual_qa_monitoring_parallel():
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # DEV files
     dev_chart_path = os.path.join(LATEST_DIR, "dev_metrics_chart.png")
     generate_single_chart(dev_metrics["raw_data"], dev_metrics, "DEV", dev_chart_path)
     with open(os.path.join(LATEST_DIR, "dev_baseline_metrics.json"), "w", encoding="utf-8") as f:
         json.dump(dev_metrics, f, indent=4)
 
-    # FUTURE files
     feature_chart_path = os.path.join(LATEST_DIR, "feature_metrics_chart.png")
     generate_single_chart(future_metrics["raw_data"], future_metrics, "FEATURE", feature_chart_path)
     
-    # Comparison
     cpu_diff = round(future_metrics["cpu"]["avg"] - dev_metrics["cpu"]["avg"], 2)
     ram_diff = round(future_metrics["ram"]["avg"] - dev_metrics["ram"]["avg"], 2)
     gpu_diff = round(future_metrics["gpu"]["avg"] - dev_metrics["gpu"]["avg"], 2)
@@ -382,32 +185,7 @@ def test_manual_qa_monitoring_parallel():
     with open(history_file, "w", encoding="utf-8") as f:
         json.dump(full_report, f, indent=4)
         
-    # Архив в папку на основе даты
-    import shutil
-    import glob
-    
-    today = datetime.datetime.now()
-    day = today.strftime("%d").lstrip('0') or "0"
-    month = today.strftime("%B")
-    year = today.strftime("%Y")
-    base_prefix = f"{day} {month} {year}"
-    
-    # Ищем, сколько раз уже запускали сегодня
-    existing_dirs = [d for d in os.listdir(HISTORY_DIR) if os.path.isdir(os.path.join(HISTORY_DIR, d)) and d.startswith(base_prefix)]
-    run_number = len(existing_dirs) + 1
-    
-    ordinals = {1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth", 
-                6: "sixth", 7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth"}
-    run_str = ordinals.get(run_number, f"{run_number}th")
-    
-    run_folder_name = f"{base_prefix} - {run_str} run"
-    run_folder_path = os.path.join(HISTORY_DIR, run_folder_name)
-    os.makedirs(run_folder_path, exist_ok=True)
-    
-    # Копируем PNG и сам JSON
-    for png_file in glob.glob(os.path.join(LATEST_DIR, "*.png")):
-        shutil.copy2(png_file, run_folder_path)
-    shutil.copy2(history_file, run_folder_path)
+    archive_run(LATEST_DIR, HISTORY_DIR, history_file)
 
     print("\n📊 ИТОГОВЫЙ ОТЧЕТ СО СРАВНЕНИЕМ:")
     print(json.dumps(report, indent=4))
