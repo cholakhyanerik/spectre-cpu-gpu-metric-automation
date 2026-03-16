@@ -140,21 +140,21 @@ def generate_single_chart(raw_data: dict, stats: dict, mode: str, output_path: s
     
     # Добавляем текстовый блок со средними значениями вниз картинки
     summary_text = (
-        f"СРЕДНИЕ ЗНАЧЕНИЯ ЗА СЕССИЮ:\n"
-        f"CPU: {stats['cpu']['avg']}%  |  "
-        f"RAM: {stats['ram']['avg']} MB  |  "
-        f"GPU: {stats['gpu']['avg']}%"
+        f"RESOURCE USAGE RANGES:\n"
+        f"CPU usage: from {stats['cpu']['min']}% to {stats['cpu']['max']}%\n"
+        f"RAM usage: from {stats['ram']['min']} MB to {stats['ram']['max']} MB\n"
+        f"GPU usage: from {stats['gpu']['min']}% to {stats['gpu']['max']}%"
     )
     
     fig.text(0.5, 0.03, summary_text, ha='center', va='center', fontsize=12, fontweight='bold',
              bbox=dict(facecolor='#f0f0f0', edgecolor='black', boxstyle='round,pad=0.5'))
 
-    plt.tight_layout(rect=[0, 0.08, 1, 1]) # Оставляем 8% снизу для текста
+    plt.tight_layout(rect=[0, 0.12, 1, 1]) # Оставляем 12% снизу для текста
     plt.savefig(output_path)
     plt.close()
     return output_path
 
-def generate_comparison_chart(dev_raw: dict, feature_raw: dict, diff_stats: dict, output_path: str):
+def generate_comparison_chart(dev_raw: dict, feature_raw: dict, diff_stats: dict, dev_stats: dict, feature_stats: dict, output_path: str):
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 11), sharex=True)
     fig.suptitle('СРАВНЕНИЕ: DEV (пунктир) vs FEATURE (сплошная)', fontsize=16, fontweight='bold')
     
@@ -178,19 +178,16 @@ def generate_comparison_chart(dev_raw: dict, feature_raw: dict, diff_stats: dict
     ax3.legend(loc='upper right')
     
     # --- ЛОГИКА ТЕКСТОВОГО ЗАКЛЮЧЕНИЯ ---
-    def get_conclusion(name, diff, unit):
-        if diff > 0:
-            return f"[!] {name}: УХУДШЕНИЕ на {abs(diff)}{unit} (DEV работает лучше)"
-        elif diff < 0:
-            return f"[+] {name}: УЛУЧШЕНИЕ на {abs(diff)}{unit} (FEATURE работает лучше)"
-        else:
-            return f"[=] {name}: БЕЗ ИЗМЕНЕНИЙ (0.0{unit})"
+    def get_conclusion(name, dev_stat, feature_stat, unit):
+        dev_range = f"from {dev_stat['min']}{unit} to {dev_stat['max']}{unit}"
+        feat_range = f"from {feature_stat['min']}{unit} to {feature_stat['max']}{unit}"
+        return f"{name} usage: DEV ({dev_range}) vs FEATURE ({feat_range})"
 
-    cpu_text = get_conclusion("CPU", diff_stats['cpu_diff'], "%")
-    ram_text = get_conclusion("RAM", diff_stats['ram_diff'], " MB")
-    gpu_text = get_conclusion("GPU", diff_stats['gpu_diff'], "%")
+    cpu_text = get_conclusion("CPU", dev_stats['cpu'], feature_stats['cpu'], "%")
+    ram_text = get_conclusion("RAM", dev_stats['ram'], feature_stats['ram'], " MB")
+    gpu_text = get_conclusion("GPU", dev_stats['gpu'], feature_stats['gpu'], "%")
     
-    summary_text = f"ВЫВОДЫ ПО ИТОГАМ ТЕСТА:\n{cpu_text}\n{ram_text}\n{gpu_text}"
+    summary_text = f"RESOURCE USAGE RANGES:\n{cpu_text}\n{ram_text}\n{gpu_text}"
     
     # Цвет фона рамки в зависимости от наличия деградации
     bg_color = '#ffe6e6' if (diff_stats['cpu_diff'] > 0 or diff_stats['ram_diff'] > 0 or diff_stats['gpu_diff'] > 0) else '#e6ffe6'
@@ -330,6 +327,7 @@ def test_manual_qa_monitoring_parallel():
         return {
             "avg": round(sum(valid) / len(valid), 2),
             "max": round(max(valid), 2),
+            "min": round(min(valid), 2),
             "median": round(statistics.median(valid), 2)
         }
         
@@ -377,12 +375,39 @@ def test_manual_qa_monitoring_parallel():
     }
     
     comparison_chart = os.path.join(LATEST_DIR, "comparison_chart.png")
-    generate_comparison_chart(dev_metrics["raw_data"], future_metrics["raw_data"], report["difference"], comparison_chart)
+    generate_comparison_chart(dev_metrics["raw_data"], future_metrics["raw_data"], report["difference"], dev_metrics, future_metrics, comparison_chart)
 
     full_report = {"summary": report, "dev_data": dev_metrics, "feature_data": future_metrics}
     history_file = os.path.join(HISTORY_DIR, f"parallel_run_{timestamp}.json")
     with open(history_file, "w", encoding="utf-8") as f:
         json.dump(full_report, f, indent=4)
+        
+    # Архив в папку на основе даты
+    import shutil
+    import glob
+    
+    today = datetime.datetime.now()
+    day = today.strftime("%d").lstrip('0') or "0"
+    month = today.strftime("%B")
+    year = today.strftime("%Y")
+    base_prefix = f"{day} {month} {year}"
+    
+    # Ищем, сколько раз уже запускали сегодня
+    existing_dirs = [d for d in os.listdir(HISTORY_DIR) if os.path.isdir(os.path.join(HISTORY_DIR, d)) and d.startswith(base_prefix)]
+    run_number = len(existing_dirs) + 1
+    
+    ordinals = {1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth", 
+                6: "sixth", 7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth"}
+    run_str = ordinals.get(run_number, f"{run_number}th")
+    
+    run_folder_name = f"{base_prefix} - {run_str} run"
+    run_folder_path = os.path.join(HISTORY_DIR, run_folder_name)
+    os.makedirs(run_folder_path, exist_ok=True)
+    
+    # Копируем PNG и сам JSON
+    for png_file in glob.glob(os.path.join(LATEST_DIR, "*.png")):
+        shutil.copy2(png_file, run_folder_path)
+    shutil.copy2(history_file, run_folder_path)
 
     print("\n📊 ИТОГОВЫЙ ОТЧЕТ СО СРАВНЕНИЕМ:")
     print(json.dumps(report, indent=4))
