@@ -16,8 +16,8 @@ load_dotenv()
 # ==========================================
 # КОНФИГУРАЦИЯ И ПУТИ
 # ==========================================
-TARGET_BUILD_PATH = os.getenv("TARGET_BUILD_PATH")
-TEST_MODE = os.getenv("TEST_MODE", "FEATURE") 
+DEV_BUILD_PATH = os.getenv("DEV_BUILD_PATH")
+FUTURE_BUILD_PATH = os.getenv("FUTURE_BUILD_PATH")
 
 # Настройка директорий для отчетов
 REPORTS_DIR = "reports"
@@ -27,8 +27,6 @@ HISTORY_DIR = os.path.join(REPORTS_DIR, "history")
 def init_directories():
     os.makedirs(LATEST_DIR, exist_ok=True)
     os.makedirs(HISTORY_DIR, exist_ok=True)
-
-BASELINE_FILE = os.path.join(LATEST_DIR, "dev_baseline_metrics.json")
 
 # Лимиты деградации
 CPU_TOLERANCE_PERCENT = float(os.getenv("CPU_TOLERANCE_PERCENT", "0.1"))
@@ -208,151 +206,193 @@ def generate_comparison_chart(dev_raw: dict, feature_raw: dict, diff_stats: dict
 # ==========================================
 # ОСНОВНОЙ ТЕСТ
 # ==========================================
-def test_manual_qa_monitoring():
+def test_manual_qa_monitoring_parallel():
     init_directories()
-    print(f"\n[АВТОМАТИЗАЦИЯ] Режим: {TEST_MODE}")
+    print("\n[АВТОМАТИЗАЦИЯ] Режим: PARALLEL (DEV & FUTURE)")
     print(f"[СТРОГИЕ ЛИМИТЫ] CPU: {CPU_TOLERANCE_PERCENT}%, RAM: {RAM_TOLERANCE_MB}MB, GPU: {GPU_TOLERANCE_PERCENT}%")
     
-    if not TARGET_BUILD_PATH or not os.path.exists(TARGET_BUILD_PATH):
-        pytest.skip(f"Билд не найден: {TARGET_BUILD_PATH}")
+    if not DEV_BUILD_PATH or not os.path.exists(DEV_BUILD_PATH):
+        pytest.skip(f"Билд DEV не найден: {DEV_BUILD_PATH}")
+    if not FUTURE_BUILD_PATH or not os.path.exists(FUTURE_BUILD_PATH):
+        pytest.skip(f"Билд FUTURE не найден: {FUTURE_BUILD_PATH}")
 
-    process = subprocess.Popen([TARGET_BUILD_PATH])
+    # Launch both processes
+    dev_process = subprocess.Popen([DEV_BUILD_PATH])
+    future_process = subprocess.Popen([FUTURE_BUILD_PATH])
     
     try:
-        ps_proc = psutil.Process(process.pid)
+        dev_ps = psutil.Process(dev_process.pid)
     except psutil.NoSuchProcess:
-        pytest.fail("Приложение закрылось сразу после запуска.")
+        future_process.terminate()
+        pytest.fail("DEV приложение сразу закрылось.")
+        
+    try:
+        future_ps = psutil.Process(future_process.pid)
+    except psutil.NoSuchProcess:
+        dev_process.terminate()
+        pytest.fail("FUTURE приложение сразу закрылось.")
 
     print("\n" + "="*50)
-    print("🟢 ПРИЛОЖЕНИЕ ЗАПУЩЕНО! (Мониторинг вкл. для модалок и Универсального GPU)")
-    print("👉 Тестируй мануально. Закрой приложение для получения отчета.")
+    print("🟢 ОБА ПРИЛОЖЕНИЯ ЗАПУЩЕНЫ! (DEV и FUTURE)")
+    print("👉 Тестируй мануально ОБА приложения. Закрой их оба для получения отчета.")
     print("="*50 + "\n")
 
-    time_sec, cpu_samples, ram_samples, gpu_samples = [], [], [], []
-    process_cache = {}
+    time_sec = []
+    dev_cpu_samples, dev_ram_samples, dev_gpu_samples = [], [], []
+    future_cpu_samples, future_ram_samples, future_gpu_samples = [], [], []
     
-    get_process_tree_metrics(ps_proc, process_cache)
+    dev_cache, future_cache = {}, {}
+    
+    get_process_tree_metrics(dev_ps, dev_cache)
+    get_process_tree_metrics(future_ps, future_cache)
     time.sleep(1)
 
     seconds_passed = 0
+    dev_running = True
+    future_running = True
+    
     try:
-        while True:
-            if process.poll() is not None:
-                break
-                
-            try:
-                if not ps_proc.is_running():
-                    break
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                break
-                
-            cpu_usage, ram_usage_mb = get_process_tree_metrics(ps_proc, process_cache)
-            gpu_usage = get_gpu_metric()
+        while dev_running or future_running:
+            # Check DEV state
+            if dev_running:
+                if dev_process.poll() is not None:
+                    dev_running = False
+                else:
+                    try:
+                        if not dev_ps.is_running():
+                            dev_running = False
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        dev_running = False
             
+            # Check FUTURE state
+            if future_running:
+                if future_process.poll() is not None:
+                    future_running = False
+                else:
+                    try:
+                        if not future_ps.is_running():
+                            future_running = False
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        future_running = False
+
+            if not dev_running and not future_running:
+                break
+                
+            # Read metrics
+            if dev_running:
+                d_cpu, d_ram = get_process_tree_metrics(dev_ps, dev_cache)
+                dev_cpu_samples.append(d_cpu)
+                dev_ram_samples.append(d_ram)
+            else:
+                dev_cpu_samples.append(0.0)
+                dev_ram_samples.append(0.0)
+                
+            if future_running:
+                f_cpu, f_ram = get_process_tree_metrics(future_ps, future_cache)
+                future_cpu_samples.append(f_cpu)
+                future_ram_samples.append(f_ram)
+            else:
+                future_cpu_samples.append(0.0)
+                future_ram_samples.append(0.0)
+                
+            gpu_load = get_gpu_metric()
+            if dev_running:
+                dev_gpu_samples.append(gpu_load)
+            else:
+                dev_gpu_samples.append(0.0)
+            if future_running:
+                future_gpu_samples.append(gpu_load)
+            else:
+                future_gpu_samples.append(0.0)
+
             time_sec.append(seconds_passed)
-            cpu_samples.append(cpu_usage)
-            ram_samples.append(ram_usage_mb)
-            gpu_samples.append(gpu_usage)
-            
             seconds_passed += 1
             time.sleep(0.5)
+            
     finally:
-        if process.poll() is None:
-            try:
-                process.terminate()
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            except Exception:
-                pass
+        for p in [dev_process, future_process]:
+            if p.poll() is None:
+                try:
+                    p.terminate()
+                    p.wait(timeout=3)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
 
-    print("\n[АВТОМАТИЗАЦИЯ] Приложение закрыто. Генерация отчетов...")
-    
-    current_metrics = {
-        "duration_seconds": len(cpu_samples),
-        "cpu": {
-            "avg": round(sum(cpu_samples) / len(cpu_samples), 2) if cpu_samples else 0.0,
-            "max": round(max(cpu_samples), 2) if cpu_samples else 0.0,
-            "median": round(statistics.median(cpu_samples), 2) if cpu_samples else 0.0
-        },
-        "ram": {
-            "avg": round(sum(ram_samples) / len(ram_samples), 2) if ram_samples else 0.0,
-            "max": round(max(ram_samples), 2) if ram_samples else 0.0,
-            "median": round(statistics.median(ram_samples), 2) if ram_samples else 0.0
-        },
-        "gpu": {
-            "avg": round(sum(gpu_samples) / len(gpu_samples), 2) if gpu_samples else 0.0,
-            "max": round(max(gpu_samples), 2) if gpu_samples else 0.0,
-            "median": round(statistics.median(gpu_samples), 2) if gpu_samples else 0.0
-        },
-        "raw_data": {
-            "time": time_sec,
-            "cpu": cpu_samples,
-            "ram": ram_samples,
-            "gpu": gpu_samples
+    print("\n[АВТОМАТИЗАЦИЯ] Оба приложения закрыты. Генерация отчетов...")
+
+    def safe_calc_stats(samples):
+        valid = [s for s in samples if s > 0]
+        if not valid:
+            valid = [0.0]
+        return {
+            "avg": round(sum(valid) / len(valid), 2),
+            "max": round(max(valid), 2),
+            "median": round(statistics.median(valid), 2)
         }
+        
+    dev_metrics = {
+        "duration_seconds": len(dev_cpu_samples),
+        "cpu": safe_calc_stats(dev_cpu_samples),
+        "ram": safe_calc_stats(dev_ram_samples),
+        "gpu": safe_calc_stats(dev_gpu_samples),
+        "raw_data": {"time": time_sec, "cpu": dev_cpu_samples, "ram": dev_ram_samples, "gpu": dev_gpu_samples}
     }
-
+    
+    future_metrics = {
+        "duration_seconds": len(future_cpu_samples),
+        "cpu": safe_calc_stats(future_cpu_samples),
+        "ram": safe_calc_stats(future_ram_samples),
+        "gpu": safe_calc_stats(future_gpu_samples),
+        "raw_data": {"time": time_sec, "cpu": future_cpu_samples, "ram": future_ram_samples, "gpu": future_gpu_samples}
+    }
+    
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    if TEST_MODE == "DEV":
-        with open(BASELINE_FILE, "w", encoding="utf-8") as f:
-            json.dump(current_metrics, f, indent=4)
-            
-        chart_path = os.path.join(LATEST_DIR, "dev_metrics_chart.png")
-        # Передаем статистику для отображения на графике
-        generate_single_chart(current_metrics["raw_data"], current_metrics, "DEV", chart_path)
-        
-        history_file = os.path.join(HISTORY_DIR, f"dev_run_{timestamp}.json")
-        with open(history_file, "w", encoding="utf-8") as f:
-            json.dump(current_metrics, f, indent=4)
-            
-        print("\n✅ ЭТАЛОННЫЕ МЕТРИКИ (DEV) УСПЕШНО СОХРАНЕНЫ:")
-        print(f"📁 Папка: {LATEST_DIR}")
-        assert True
+    # DEV files
+    dev_chart_path = os.path.join(LATEST_DIR, "dev_metrics_chart.png")
+    generate_single_chart(dev_metrics["raw_data"], dev_metrics, "DEV", dev_chart_path)
+    with open(os.path.join(LATEST_DIR, "dev_baseline_metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(dev_metrics, f, indent=4)
 
-    elif TEST_MODE == "FEATURE":
-        if not os.path.exists(BASELINE_FILE):
-            pytest.fail("Нет эталона. Сначала запусти в режиме DEV.")
+    # FUTURE files
+    feature_chart_path = os.path.join(LATEST_DIR, "feature_metrics_chart.png")
+    generate_single_chart(future_metrics["raw_data"], future_metrics, "FEATURE", feature_chart_path)
+    
+    # Comparison
+    cpu_diff = round(future_metrics["cpu"]["avg"] - dev_metrics["cpu"]["avg"], 2)
+    ram_diff = round(future_metrics["ram"]["avg"] - dev_metrics["ram"]["avg"], 2)
+    gpu_diff = round(future_metrics["gpu"]["avg"] - dev_metrics["gpu"]["avg"], 2)
 
-        with open(BASELINE_FILE, "r", encoding="utf-8") as f:
-            dev_metrics = json.load(f)
-
-        cpu_diff = round(current_metrics["cpu"]["avg"] - dev_metrics["cpu"]["avg"], 2)
-        ram_diff = round(current_metrics["ram"]["avg"] - dev_metrics["ram"]["avg"], 2)
-        gpu_diff = round(current_metrics["gpu"]["avg"] - dev_metrics["gpu"]["avg"], 2)
-
-        report = {
-            "baseline_dev_stats": dev_metrics["cpu"], 
-            "feature_test_stats": current_metrics["cpu"],
-            "difference": {
-                "cpu_diff": cpu_diff,
-                "ram_diff": ram_diff,
-                "gpu_diff": gpu_diff
-            }
+    report = {
+        "baseline_dev_stats": dev_metrics["cpu"], 
+        "feature_test_stats": future_metrics["cpu"],
+        "difference": {
+            "cpu_diff": cpu_diff,
+            "ram_diff": ram_diff,
+            "gpu_diff": gpu_diff
         }
+    }
+    
+    comparison_chart = os.path.join(LATEST_DIR, "comparison_chart.png")
+    generate_comparison_chart(dev_metrics["raw_data"], future_metrics["raw_data"], report["difference"], comparison_chart)
 
-        feature_chart = os.path.join(LATEST_DIR, "feature_metrics_chart.png")
-        generate_single_chart(current_metrics["raw_data"], current_metrics, "FEATURE", feature_chart)
+    full_report = {"summary": report, "dev_data": dev_metrics, "feature_data": future_metrics}
+    history_file = os.path.join(HISTORY_DIR, f"parallel_run_{timestamp}.json")
+    with open(history_file, "w", encoding="utf-8") as f:
+        json.dump(full_report, f, indent=4)
+
+    print("\n📊 ИТОГОВЫЙ ОТЧЕТ СО СРАВНЕНИЕМ:")
+    print(json.dumps(report, indent=4))
+    print(f"\n📁 Все актуальные графики сохранены в папке: {LATEST_DIR}")
+
+    assert cpu_diff <= CPU_TOLERANCE_PERCENT, \
+        f"[БЛОКЕР] Деградация ЦП! Feature использует на {cpu_diff}% больше CPU."
         
-        comparison_chart = os.path.join(LATEST_DIR, "comparison_chart.png")
-        # Передаем словарь с разницей для генерации текстового блока
-        generate_comparison_chart(dev_metrics["raw_data"], current_metrics["raw_data"], report["difference"], comparison_chart)
+    assert ram_diff <= RAM_TOLERANCE_MB, \
+        f"Утечка ОЗУ! Feature использует на {ram_diff} MB больше памяти."
         
-        full_report = {"summary": report, "feature_data": current_metrics}
-        history_file = os.path.join(HISTORY_DIR, f"feature_run_{timestamp}.json")
-        with open(history_file, "w", encoding="utf-8") as f:
-            json.dump(full_report, f, indent=4)
-
-        print("\n📊 ИТОГОВЫЙ ОТЧЕТ СО СРАВНЕНИЕМ:")
-        print(json.dumps(report, indent=4))
-        print(f"\n📁 Все актуальные графики сохранены в папке: {LATEST_DIR}")
-
-        assert cpu_diff <= CPU_TOLERANCE_PERCENT, \
-            f"[БЛОКЕР] Деградация ЦП! Feature использует на {cpu_diff}% больше CPU."
-            
-        assert ram_diff <= RAM_TOLERANCE_MB, \
-            f"Утечка ОЗУ! Feature использует на {ram_diff} MB больше памяти."
-            
-        assert gpu_diff <= GPU_TOLERANCE_PERCENT, \
-            f"[БЛОКЕР] Деградация ГП! Feature использует на {gpu_diff}% больше GPU."
+    assert gpu_diff <= GPU_TOLERANCE_PERCENT, \
+        f"[БЛОКЕР] Деградация ГП! Feature использует на {gpu_diff}% больше GPU."
