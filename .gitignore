@@ -24,3 +24,5 @@ reports/
 # Специфичные для macOS/Windows файлы ОС
 .DS_Store
 Thumbs.db
+
+.mypy_cache
