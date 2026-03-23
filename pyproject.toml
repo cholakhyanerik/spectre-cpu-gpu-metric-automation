@@ -13,4 +13,5 @@ dependencies = [
     "pytest-html>=4.2.0",
     "python-dotenv>=1.2.2",
     "setuptools>=82.0.1",
+    "fonttools==4.62.1",
 ]
